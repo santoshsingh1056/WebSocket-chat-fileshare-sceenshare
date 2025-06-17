@@ -6,9 +6,6 @@ import { User, Paperclip, Send, ScreenShare, X } from 'lucide-react';
 
 const API_URL = 'http://localhost:8080';
 
-// A single RTCPeerConnection instance
-let peerConnection;
-// Google's public STUN servers
 const peerConnectionConfig = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -17,102 +14,196 @@ const peerConnectionConfig = {
 };
 
 function App() {
-    const [stompClient, setStompClient] = useState(null);
     const [username, setUsername] = useState('');
     const [isLoggedIn, setIsLoggedIn] = useState(false);
     const [activeUsers, setActiveUsers] = useState([]);
     const [currentChat, setCurrentChat] = useState(null);
     const [messages, setMessages] = useState([]);
     const [inputValue, setInputValue] = useState('');
-    
-    // Screen sharing state
     const [isSharingScreen, setIsSharingScreen] = useState(false);
+    
     const localVideoRef = useRef(null);
     const remoteVideoRef = useRef(null);
-    const localStreamRef = useRef(null);
-    
     const fileInputRef = useRef(null);
+    
+    // Refs for mutable objects that shouldn't trigger re-renders
+    const peerConnectionRef = useRef(null);
+    const localStreamRef = useRef(null);
+    const stompClientRef = useRef(null);
+    const iceCandidateQueueRef = useRef([]);
 
-    // ---- WebSocket and Chat Logic ----
+    // ---- Cleanup Logic ----
+    const stopScreenShare = useCallback(() => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(track => track.stop());
+            localStreamRef.current = null;
+        }
+        if (peerConnectionRef.current) {
+            peerConnectionRef.current.onicecandidate = null;
+            peerConnectionRef.current.ontrack = null;
+            peerConnectionRef.current.close();
+            peerConnectionRef.current = null;
+        }
+        setIsSharingScreen(false);
+    }, []);
 
+    useEffect(() => {
+        // Stop sharing if the chat partner changes
+        if (isSharingScreen) {
+            stopScreenShare();
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentChat]);
+    
+    // ---- WebRTC Signaling and Connection ----
+    const createPeerConnection = useCallback(() => {
+        // Always close any existing connection before creating a new one
+        if (peerConnectionRef.current) {
+            peerConnectionRef.current.close();
+        }
+        iceCandidateQueueRef.current = [];
+        
+        const pc = new RTCPeerConnection(peerConnectionConfig);
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate && stompClientRef.current && currentChat) {
+                stompClientRef.current.publish({
+                    destination: '/app/chat.webrtc.signal',
+                    body: JSON.stringify({ sender: username, recipient: currentChat, content: JSON.stringify({ 'ice': event.candidate }), type: 'SIGNAL' }),
+                });
+            }
+        };
+
+        pc.ontrack = (event) => {
+            if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = event.streams[0];
+            }
+        };
+
+        peerConnectionRef.current = pc;
+        return pc;
+    }, [currentChat, username]);
+    
+    const handleSignalingData = useCallback(async (data) => {
+        const signal = JSON.parse(data.content);
+        
+        let pc = peerConnectionRef.current;
+        if (signal.sdp && signal.sdp.type === 'offer') {
+             pc = createPeerConnection();
+        }
+        
+        if (!pc) return;
+
+        try {
+            if (signal.sdp) {
+                await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+                
+                while(iceCandidateQueueRef.current.length > 0) {
+                    const candidate = iceCandidateQueueRef.current.shift();
+                    await pc.addIceCandidate(candidate);
+                }
+
+                if (signal.sdp.type === 'offer') {
+                    setIsSharingScreen(true);
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+
+                    if (stompClientRef.current) {
+                        stompClientRef.current.publish({
+                            destination: '/app/chat.webrtc.signal',
+                            body: JSON.stringify({ sender: username, recipient: currentChat, content: JSON.stringify({ 'sdp': pc.localDescription }), type: 'SIGNAL' })
+                        });
+                    }
+                }
+            } else if (signal.ice) {
+                if (pc.remoteDescription) {
+                    await pc.addIceCandidate(new RTCIceCandidate(signal.ice));
+                } else {
+                    iceCandidateQueueRef.current.push(new RTCIceCandidate(signal.ice));
+                }
+            }
+        } catch (error) {
+            console.error("Error handling signaling data:", error);
+        }
+    }, [createPeerConnection, currentChat, username]);
+
+
+    const startScreenShare = async () => {
+        if (!currentChat) return;
+        const pc = createPeerConnection();
+        try {
+            const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+            stream.getTracks().forEach(track => {
+                track.onended = () => stopScreenShare();
+                pc.addTrack(track, stream);
+            });
+            localStreamRef.current = stream;
+            setIsSharingScreen(true);
+            
+            await new Promise(resolve => setTimeout(resolve, 0));
+            
+            if (localVideoRef.current) {
+                localVideoRef.current.srcObject = stream;
+            }
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            if (stompClientRef.current) {
+                stompClientRef.current.publish({
+                    destination: '/app/chat.webrtc.signal',
+                    body: JSON.stringify({ sender: username, recipient: currentChat, content: JSON.stringify({ 'sdp': pc.localDescription }), type: 'SIGNAL' }),
+                });
+            }
+        } catch (error) {
+            console.error("Could not start screen sharing:", error);
+            stopScreenShare();
+        }
+    };
+
+    // ---- Standard Chat and WebSocket Logic ----
     const connect = useCallback(() => {
         const socket = new SockJS(`${API_URL}/ws`);
         const client = new Client({
             webSocketFactory: () => socket,
             reconnectDelay: 5000,
             onConnect: () => {
-                console.log('Connected to WebSocket');
-                setStompClient(client);
-
-                // Subscribe to public topic for user list updates
-                client.subscribe('/topic/public', (message) => {
-                    const updatedUsers = JSON.parse(message.body);
-                    setActiveUsers(updatedUsers.filter(u => u !== username));
-                });
-
-                // Subscribe to user-specific queue for private messages
-                client.subscribe(`/user/${username}/queue/messages`, (message) => {
-                    const receivedMessage = JSON.parse(message.body);
-                    setMessages(prev => [...prev, receivedMessage]);
-                });
-
-                // Subscribe to user-specific queue for WebRTC signals
-                client.subscribe(`/user/${username}/queue/webrtc`, (message) => {
-                    handleSignalingData(JSON.parse(message.body));
-                });
-
-                // Announce user joining
-                client.publish({
-                    destination: '/app/chat.addUser',
-                    body: JSON.stringify({ sender: username, type: 'JOIN' }),
-                });
+                stompClientRef.current = client;
+                client.subscribe('/topic/public', (message) => setActiveUsers(JSON.parse(message.body).filter(u => u !== username)));
+                client.subscribe(`/user/${username}/queue/messages`, (message) => setMessages(prev => [...prev, JSON.parse(message.body)]));
+                client.subscribe(`/user/${username}/queue/webrtc`, (message) => handleSignalingData(JSON.parse(message.body)));
+                client.publish({ destination: '/app/chat.addUser', body: JSON.stringify({ sender: username, type: 'JOIN' }) });
             },
             onDisconnect: () => {
-                console.log('Disconnected');
-                // Clean up on disconnect
-                if(localStreamRef.current) {
-                    localStreamRef.current.getTracks().forEach(track => track.stop());
-                }
-                if(peerConnection) {
-                    peerConnection.close();
-                }
-                setIsSharingScreen(false);
-            },
-            onStompError: (frame) => {
-                console.error('Broker reported error: ' + frame.headers['message']);
-                console.error('Additional details: ' + frame.body);
-            },
+                stompClientRef.current = null;
+            }
         });
-
         client.activate();
-    }, [username]);
+    }, [username, handleSignalingData]);
 
     const handleLogin = (e) => {
         e.preventDefault();
-        if (username.trim()) {
-            setIsLoggedIn(true);
-        }
+        if (username.trim()) setIsLoggedIn(true);
     };
     
     useEffect(() => {
-        if(isLoggedIn) {
+        if (isLoggedIn) {
             connect();
         }
+        return () => {
+            if (stompClientRef.current) {
+                stompClientRef.current.deactivate();
+            }
+        };
     }, [isLoggedIn, connect]);
     
     const sendMessage = (content, type = 'CHAT') => {
-        if (stompClient && currentChat && (content.trim() || type !== 'CHAT')) {
-            const chatMessage = {
-                sender: username,
-                recipient: currentChat,
-                content: content,
-                type: type,
-            };
-            stompClient.publish({
+        if (stompClientRef.current && currentChat && (content.trim() || type !== 'CHAT')) {
+            const chatMessage = { sender: username, recipient: currentChat, content, type };
+            stompClientRef.current.publish({
                 destination: '/app/chat.sendMessage',
                 body: JSON.stringify(chatMessage),
             });
-            // Add sent message to local state immediately
             setMessages(prev => [...prev, { ...chatMessage, timestamp: new Date().toISOString() }]);
             setInputValue('');
         }
@@ -121,149 +212,18 @@ function App() {
     const handleFileUpload = async (event) => {
         const file = event.target.files[0];
         if (!file || !currentChat) return;
-
         const formData = new FormData();
         formData.append('file', file);
-        
         try {
-            const response = await axios.post(`${API_URL}/uploadFile`, formData, {
-                headers: { 'Content-Type': 'multipart/form-data' },
-            });
-            const fileUrl = response.data;
-            sendMessage(fileUrl, 'FILE');
+            const response = await axios.post(`${API_URL}/uploadFile`, formData);
+            sendMessage(response.data, 'FILE');
         } catch (error) {
-            console.error('Error uploading file:', error);
-            // Replaced alert with a console log
-            console.error('File upload failed.');
+            console.error('File upload failed:', error);
         }
-        // Reset file input
         fileInputRef.current.value = "";
     };
 
-    // ---- WebRTC Screen Sharing Logic ----
-
-    const handleSignalingData = (data) => {
-        if (!peerConnection) createPeerConnection();
-        // The data.content will contain the SDP or ICE candidate
-        const signal = JSON.parse(data.content);
-        if (signal.sdp) {
-            peerConnection.setRemoteDescription(new RTCSessionDescription(signal.sdp))
-                .then(() => {
-                    if (signal.sdp.type === 'offer') {
-                        createAnswer();
-                    }
-                }).catch(e => console.error("Error setting remote description:", e));
-        } else if (signal.ice) {
-            peerConnection.addIceCandidate(new RTCIceCandidate(signal.ice))
-                .catch(e => console.error("Error adding received ice candidate", e));
-        }
-    };
-    
-    const createPeerConnection = () => {
-        peerConnection = new RTCPeerConnection(peerConnectionConfig);
-        
-        peerConnection.onicecandidate = (event) => {
-            if (event.candidate && stompClient && currentChat) {
-                const signalPayload = {
-                    sender: username,
-                    recipient: currentChat,
-                    content: JSON.stringify({ 'ice': event.candidate }),
-                    type: 'SIGNAL'
-                };
-                 stompClient.publish({
-                    destination: '/app/chat.webrtc.signal',
-                    body: JSON.stringify(signalPayload),
-                });
-            }
-        };
-
-        peerConnection.ontrack = (event) => {
-             if (remoteVideoRef.current && event.streams[0]) {
-                remoteVideoRef.current.srcObject = event.streams[0];
-                setIsSharingScreen(true); // Show video elements
-            }
-        };
-    };
-    
-    const createOffer = () => {
-         if (!peerConnection) createPeerConnection();
-         localStreamRef.current.getTracks().forEach(track => {
-            peerConnection.addTrack(track, localStreamRef.current);
-        });
-
-        peerConnection.createOffer()
-            .then(offer => peerConnection.setLocalDescription(offer))
-            .then(() => {
-                if (stompClient && currentChat) {
-                   const signalPayload = {
-                        sender: username,
-                        recipient: currentChat,
-                        content: JSON.stringify({ 'sdp': peerConnection.localDescription }),
-                        type: 'SIGNAL'
-                    };
-                    stompClient.publish({
-                        destination: '/app/chat.webrtc.signal',
-                        body: JSON.stringify(signalPayload),
-                    });
-                }
-            }).catch(e => console.error("Error creating offer:", e));
-    };
-    
-    const createAnswer = () => {
-        peerConnection.createAnswer()
-            .then(answer => peerConnection.setLocalDescription(answer))
-            .then(() => {
-                 if (stompClient && currentChat) {
-                    const signalPayload = {
-                        sender: username,
-                        recipient: currentChat,
-                        content: JSON.stringify({ 'sdp': peerConnection.localDescription }),
-                        type: 'SIGNAL'
-                    };
-                    stompClient.publish({
-                        destination: '/app/chat.webrtc.signal',
-                        body: JSON.stringify(signalPayload),
-                    });
-                 }
-            }).catch(e => console.error("Error creating answer:", e));
-    };
-
-    const startScreenShare = async () => {
-        if (!currentChat) {
-            console.error("Please select a user to share your screen with.");
-            return;
-        }
-
-        try {
-            const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-            localStreamRef.current = stream;
-            if (localVideoRef.current) {
-                localVideoRef.current.srcObject = stream;
-            }
-            setIsSharingScreen(true);
-            createOffer();
-        } catch (error) {
-            console.error("Error starting screen share:", error);
-            console.error("Could not start screen sharing. Please grant permissions.");
-        }
-    };
-    
-    const stopScreenShare = () => {
-        if(localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach(track => track.stop());
-            localStreamRef.current = null;
-        }
-        if (peerConnection) {
-            peerConnection.close();
-            peerConnection = null;
-        }
-        setIsSharingScreen(false);
-        if(localVideoRef.current) localVideoRef.current.srcObject = null;
-        if(remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-    };
-
-
-    // UI Rendering
+    // --- UI Rendering ---
     if (!isLoggedIn) {
         return <LoginScreen username={username} setUsername={setUsername} handleLogin={handleLogin} />;
     }
@@ -275,20 +235,10 @@ function App() {
                 <div className="flex flex-col flex-auto h-full p-6">
                    {currentChat ? (
                         <div className="flex flex-col flex-auto flex-shrink-0 rounded-2xl bg-white h-full p-4 relative">
-                            <ChatHeader 
-                                user={currentChat} 
-                                onShare={startScreenShare} 
-                                onStopShare={stopScreenShare}
-                                isSharing={isSharingScreen}
-                            />
+                            <ChatHeader user={currentChat} onShare={startScreenShare} onStopShare={stopScreenShare} isSharing={isSharingScreen}/>
                             {isSharingScreen && <ScreenShareView localRef={localVideoRef} remoteRef={remoteVideoRef} />}
                             <MessageArea messages={messages} username={username} />
-                            <MessageInput 
-                                value={inputValue} 
-                                setValue={setInputValue} 
-                                onSend={sendMessage}
-                                onFileClick={() => fileInputRef.current.click()}
-                            />
+                            <MessageInput value={inputValue} setValue={setInputValue} onSend={sendMessage} onFileClick={() => fileInputRef.current.click()}/>
                             <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
                         </div>
                    ) : (
@@ -300,7 +250,7 @@ function App() {
     );
 }
 
-// ---- Sub-components ----
+// ---- Sub-components ---- (No changes)
 
 const LoginScreen = ({ username, setUsername, handleLogin }) => (
     <div className="min-h-screen bg-gray-100 flex flex-col justify-center sm:py-12">
@@ -309,18 +259,8 @@ const LoginScreen = ({ username, setUsername, handleLogin }) => (
             <div className="bg-white shadow w-full rounded-lg divide-y divide-gray-200">
                 <form onSubmit={handleLogin} className="px-5 py-7">
                     <label className="font-semibold text-sm text-gray-600 pb-1 block">Username</label>
-                    <input 
-                        type="text" 
-                        value={username}
-                        onChange={(e) => setUsername(e.target.value)}
-                        className="border rounded-lg px-3 py-2 mt-1 mb-5 text-sm w-full" 
-                        placeholder="Enter your username"
-                        required
-                    />
-                    <button 
-                        type="submit" 
-                        className="transition duration-200 bg-blue-500 hover:bg-blue-600 focus:bg-blue-700 focus:shadow-sm focus:ring-4 focus:ring-blue-500 focus:ring-opacity-50 text-white w-full py-2.5 rounded-lg text-sm shadow-sm hover:shadow-md font-semibold text-center inline-block"
-                    >
+                    <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} className="border rounded-lg px-3 py-2 mt-1 mb-5 text-sm w-full" placeholder="Enter your username" required />
+                    <button type="submit" className="transition duration-200 bg-blue-500 hover:bg-blue-600 focus:bg-blue-700 focus:shadow-sm focus:ring-4 focus:ring-blue-500 focus:ring-opacity-50 text-white w-full py-2.5 rounded-lg text-sm shadow-sm hover:shadow-md font-semibold text-center inline-block">
                         <span className="inline-block mr-2">Join Chat</span>
                     </button>
                 </form>
@@ -408,12 +348,8 @@ const MessageArea = ({ messages, username }) => {
         <div id="messages" className="flex flex-col space-y-4 p-3 overflow-y-auto scrollbar-thumb-blue scrollbar-thumb-rounded scrollbar-track-blue-lighter scrollbar-w-2 scrolling-touch">
             {messages.map((msg, index) => {
                 const isMyMessage = msg.sender === username;
-                if (msg.type === 'CHAT') {
-                    return <ChatMessage key={index} msg={msg} isMyMessage={isMyMessage} />;
-                }
-                if (msg.type === 'FILE') {
-                    return <FileMessage key={index} msg={msg} isMyMessage={isMyMessage} />;
-                }
+                if (msg.type === 'CHAT') return <ChatMessage key={index} msg={msg} isMyMessage={isMyMessage} />;
+                if (msg.type === 'FILE') return <FileMessage key={index} msg={msg} isMyMessage={isMyMessage} />;
                 return null;
             })}
             <div ref={endOfMessagesRef} />
@@ -424,15 +360,9 @@ const MessageArea = ({ messages, username }) => {
 const ChatMessage = ({ msg, isMyMessage }) => (
     <div className={`flex items-end ${isMyMessage ? 'justify-end' : ''}`}>
         <div className={`flex flex-col space-y-2 text-sm max-w-xs mx-2 order-${isMyMessage ? 2 : 1} items-${isMyMessage ? 'end' : 'start'}`}>
-            <div>
-                <span className={`px-4 py-2 rounded-lg inline-block ${isMyMessage ? 'rounded-br-none bg-blue-600 text-white' : 'rounded-bl-none bg-gray-300 text-gray-600'}`}>
-                    {msg.content}
-                </span>
-            </div>
+            <div><span className={`px-4 py-2 rounded-lg inline-block ${isMyMessage ? 'rounded-br-none bg-blue-600 text-white' : 'rounded-bl-none bg-gray-300 text-gray-600'}`}>{msg.content}</span></div>
         </div>
-        <div className={`flex items-center justify-center h-6 w-6 rounded-full bg-indigo-200 order-${isMyMessage ? 1 : 2}`}>
-            <User size={14}/>
-        </div>
+        <div className={`flex items-center justify-center h-6 w-6 rounded-full bg-indigo-200 order-${isMyMessage ? 1 : 2}`}><User size={14}/></div>
     </div>
 );
 
@@ -440,45 +370,23 @@ const FileMessage = ({ msg, isMyMessage }) => (
      <div className={`flex items-end ${isMyMessage ? 'justify-end' : ''}`}>
         <div className={`flex flex-col space-y-2 text-sm max-w-xs mx-2 order-${isMyMessage ? 2 : 1} items-${isMyMessage ? 'end' : 'start'}`}>
             <div>
-                <a 
-                    href={`${API_URL}${msg.content}`} 
-                    target="_blank" 
-                    rel="noopener noreferrer"
-                    className={`px-4 py-2 rounded-lg inline-flex items-center gap-2 ${isMyMessage ? 'rounded-br-none bg-green-600 text-white' : 'rounded-bl-none bg-green-200 text-gray-800'}`}
-                >
-                    <Paperclip size={16} />
-                    <span>Shared File</span>
+                <a href={`${API_URL}${msg.content}`} target="_blank" rel="noopener noreferrer" className={`px-4 py-2 rounded-lg inline-flex items-center gap-2 ${isMyMessage ? 'rounded-br-none bg-green-600 text-white' : 'rounded-bl-none bg-green-200 text-gray-800'}`}>
+                    <Paperclip size={16} /><span>Shared File</span>
                 </a>
             </div>
         </div>
-        <div className={`flex items-center justify-center h-6 w-6 rounded-full bg-indigo-200 order-${isMyMessage ? 1 : 2}`}>
-            <User size={14}/>
-        </div>
+        <div className={`flex items-center justify-center h-6 w-6 rounded-full bg-indigo-200 order-${isMyMessage ? 1 : 2}`}><User size={14}/></div>
     </div>
 );
 
 const MessageInput = ({ value, setValue, onSend, onFileClick }) => (
     <div className="border-t-2 border-gray-200 px-4 pt-4 mb-2 sm:mb-0">
         <div className="relative flex">
-            <button onClick={onFileClick} className="absolute left-0 top-0 mt-3 ml-2 text-gray-500 hover:text-gray-700">
-                <Paperclip size={24} />
-            </button>
-            <input 
-                type="text" 
-                placeholder="Write your message!" 
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && onSend(value)}
-                className="w-full focus:outline-none focus:placeholder-gray-400 text-gray-600 placeholder-gray-600 pl-12 bg-gray-200 rounded-md py-3" 
-            />
+            <button onClick={onFileClick} className="absolute left-0 top-0 mt-3 ml-2 text-gray-500 hover:text-gray-700"><Paperclip size={24} /></button>
+            <input type="text" placeholder="Write your message!" value={value} onChange={(e) => setValue(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && onSend(value)} className="w-full focus:outline-none focus:placeholder-gray-400 text-gray-600 placeholder-gray-600 pl-12 bg-gray-200 rounded-md py-3" />
             <div className="absolute right-0 items-center inset-y-0 hidden sm:flex">
-                <button 
-                    type="button" 
-                    onClick={() => onSend(value)}
-                    className="inline-flex items-center justify-center rounded-lg px-4 py-3 transition duration-500 ease-in-out text-white bg-blue-500 hover:bg-blue-400 focus:outline-none"
-                >
-                    <span className="font-bold">Send</span>
-                    <Send size={18} className="ml-2" />
+                <button type="button" onClick={() => onSend(value)} className="inline-flex items-center justify-center rounded-lg px-4 py-3 transition duration-500 ease-in-out text-white bg-blue-500 hover:bg-blue-400 focus:outline-none">
+                    <span className="font-bold">Send</span><Send size={18} className="ml-2" />
                 </button>
             </div>
         </div>
@@ -491,6 +399,5 @@ const WelcomeScreen = () => (
         <p className="text-gray-400 mt-2">Select a user from the list on the left to start a conversation.</p>
     </div>
 );
-
 
 export default App;
